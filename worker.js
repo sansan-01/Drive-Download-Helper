@@ -8,17 +8,43 @@ const ALLOWED_HOSTS = [
   'drive.google.com',
   'www.dropbox.com',
   'drive.usercontent.google.com',
-  'accounts.google.com',
-  'dl.dropboxusercontent.com', // 允许所有 Dropbox 的下载子域名
+  'dl.dropboxusercontent.com', // 包括 Dropbox 分配的下载子域名
 ];
 
 // == 用户配置区域结束 ==
 
+const UPSTREAM_HEADER_TIMEOUT_MS = 30_000;
+const REQUEST_HEADERS = ['Range', 'If-Range', 'If-None-Match', 'If-Modified-Since'];
+const DOWNLOAD_HEADERS = [
+  'Accept-Ranges', 'Content-Disposition', 'Content-Encoding', 'Content-Length',
+  'Content-Range', 'Content-Type', 'ETag', 'Last-Modified',
+];
+const RESPONSE_HEADERS = {
+  'Cache-Control': 'private, no-store',
+  'Referrer-Policy': 'no-referrer',
+  'X-Content-Type-Options': 'nosniff',
+};
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+function parseShareUrl(value) {
+  return new URL(/^[a-z][a-z\d+.-]*:\/\//i.test(value) ? value : 'https://' + value);
+}
+
+function isAllowedTarget(url) {
+  const host = url.hostname;
+  return url.protocol === 'https:' && !url.username && !url.password && !url.port &&
+    (ALLOWED_HOSTS.includes(host) || (ALLOWED_HOSTS.includes('dl.dropboxusercontent.com') &&
+      /^[a-z0-9-]+\.dl\.dropboxusercontent\.com$/.test(host)));
+}
+
+function proxyUrl(origin, target) {
+  return `${origin}/${encodeURIComponent(target.href)}`;
+}
 
 const ICON_SVG = `
 <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-zap"><path d="M4 14a1 1 0 0 1-.78-1.63l2.66-3.32 2.54-3.18A.5.5 0 0 1 9 5.5h6.5a.5.5 0 0 1 .3.9L11 12v4c0 .55-.45 1-1 1H4z"/><path d="m18.5 12.5-5 5c-.22.22-.58.22-.8 0l-1.95-1.95c-.22-.22-.22-.58 0-.8s.58-.22.8 0L12 15.45l4.7-4.7c.22-.22.58-.22.8 0s.22.58 0 .8z"/></svg>`;
 
-const HOMEPAGE_HTML = `
+const homepageHtml = (nonce) => `
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -26,18 +52,69 @@ const HOMEPAGE_HTML = `
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>文件直链加速服务</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,${encodeURIComponent(ICON_SVG)}">
-  <script src="https://cdn.tailwindcss.com"></script>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&display=swap" rel="stylesheet">
   <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    body, h1, p { margin: 0; }
+    button, input { font: inherit; }
+    button { cursor: pointer; }
+    :focus-visible { outline: 3px solid #6366f1; outline-offset: 2px; }
+    [hidden] { display: none !important; }
+    .app {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 1rem;
+      color: #1f2937;
+    }
+    .app.dark-mode { color: #d1d5db; }
+    #theme-toggle {
+      position: fixed;
+      top: 1rem;
+      right: 1rem;
+      padding: .5rem;
+      border-radius: 9999px;
+      color: inherit;
+    }
+    #theme-toggle svg { display: block; width: 1.5rem; height: 1.5rem; }
+    .panel { width: 100%; max-width: 56rem; padding: 2rem; border-radius: 1rem; }
+    .panel > * + * { margin-top: 2rem; }
+    .intro { text-align: center; font-size: 1.125rem; }
+    .intro h1 { margin-bottom: 1rem; font-size: 3rem; line-height: 1; font-weight: 900; }
+    .source-controls { display: flex; flex-direction: column; gap: 1rem; }
+    #source-url, #result-text {
+      padding: 1rem;
+      border-radius: .5rem;
+      background: rgb(255 255 255 / .5);
+      color: #111827;
+    }
+    .dark-mode #source-url, .dark-mode #result-text { background: rgb(0 0 0 / .2); color: white; }
+    #source-url { flex: 1; min-width: 0; border: 2px solid transparent; }
+    #generate-btn { padding: 1rem 2rem; }
+    #result-area { padding-top: 1.5rem; }
+    #result-text { overflow-wrap: anywhere; }
+    #action-buttons { display: grid; gap: 1rem; margin-top: 1rem; }
+    #copy-btn { padding: .75rem 1rem; border: 0; border-radius: .5rem; background: #e5e7eb; color: inherit; font-weight: 600; }
+    #copy-btn:hover { background: #d1d5db; }
+    .dark-mode #copy-btn { background: #374151; }
+    .dark-mode #copy-btn:hover { background: #4b5563; }
+    #download-btn { padding: .75rem 0; text-align: center; }
+    @media (min-width: 640px) {
+      .source-controls { flex-direction: row; }
+      #action-buttons { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (min-width: 768px) {
+      .panel { padding: 3rem; }
+      .intro h1 { font-size: 4.5rem; }
+    }
     @keyframes gradient-animation {
       0% { background-position: 0% 50%; }
       50% { background-position: 100% 50%; }
       100% { background-position: 0% 50%; }
     }
     body {
-      font-family: 'Inter', sans-serif;
+      font-family: system-ui, sans-serif;
+      line-height: 1.5;
       background-size: 200% 200% !important;
       animation: gradient-animation 15s ease infinite;
       transition: background-image 0.5s ease-in-out;
@@ -64,50 +141,73 @@ const HOMEPAGE_HTML = `
     }
     .title-gradient {
       background-image: linear-gradient(to right, #6366f1, #a855f7, #ec4899);
+      background-clip: text;
+      color: transparent;
     }
     .btn-gradient {
       background-image: linear-gradient(to right, #8b5cf6 0%, #ec4899 51%, #8b5cf6 100%);
       background-size: 200% auto;
+      border: 0;
+      border-radius: .5rem;
+      color: white;
+      font-weight: 700;
+      letter-spacing: .05em;
+      text-transform: uppercase;
+      text-decoration: none;
       transition: 0.5s;
     }
     .btn-gradient:hover {
       background-position: right center;
+      transform: scale(1.05);
     }
     .toast {
+      position: fixed;
+      bottom: 1.25rem;
+      left: 50%;
+      padding: .75rem 1.5rem;
+      border-radius: .5rem;
+      box-shadow: 0 10px 15px -3px rgb(0 0 0 / .1), 0 4px 6px -4px rgb(0 0 0 / .1);
+      color: white;
+      font-weight: 600;
       opacity: 0;
+      pointer-events: none;
       transition: opacity 0.3s, transform 0.3s;
-      transform: translateY(20px);
+      transform: translate(-50%, 20px);
     }
     .toast.show {
       opacity: 1;
-      transform: translateY(0);
+      transform: translateX(-50%);
     }
   </style>
 </head>
-<body class="light-mode min-h-screen flex items-center justify-center p-4">
-  <button id="theme-toggle" class="fixed top-4 right-4 p-2 rounded-full text-gray-800 dark:text-gray-200 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 glass-container">
+<body class="app light-mode">
+  <button id="theme-toggle" class="glass-container">
     <svg id="theme-icon-light" class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m8.66-15.66l-.7.7M4.04 19.96l-.7.7M21 12h-1M4 12H3m15.66 8.66l-.7-.7M4.04 4.04l-.7-.7M12 8a4 4 0 100 8 4 4 0 000-8z"></path></svg>
-    <svg id="theme-icon-dark" class="w-6 h-6 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"></path></svg>
+    <svg id="theme-icon-dark" hidden fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"></path></svg>
   </button>
-  <div class="w-full max-w-4xl p-8 md:p-12 space-y-8 rounded-2xl glass-container glow-shadow">
-    <div class="text-center">
-      <h1 class="text-5xl md:text-7xl font-black text-transparent bg-clip-text title-gradient mb-4">极速文件链接</h1>
-      <p class="text-lg text-gray-800 dark:text-gray-300">粘贴 Google Drive 或 Dropbox 分享链接，生成永不泄露的代理下载地址。</p>
+  <div class="panel glass-container glow-shadow">
+    <div class="intro">
+      <h1 class="title-gradient">极速文件链接</h1>
+      <p>粘贴 Google Drive 或 Dropbox 分享链接，生成代理下载地址。</p>
     </div>
-    <div class="flex flex-col sm:flex-row gap-4">
-      <input id="source-url" type="text" placeholder="请在此处粘贴分享链接..." class="flex-grow p-4 border-2 border-transparent rounded-lg focus:outline-none focus:ring-4 focus:ring-purple-500/50 bg-white/50 dark:bg-black/20 text-gray-900 dark:text-white transition-all">
-      <button onclick="generateLink()" class="btn-gradient text-white font-bold px-8 py-4 rounded-lg uppercase tracking-wider transform hover:scale-105">生成链接</button>
+    <div class="source-controls">
+      <input id="source-url" type="text" placeholder="请在此处粘贴分享链接...">
+      <button id="generate-btn" class="btn-gradient">生成链接</button>
     </div>
-    <div id="result-area" class="hidden pt-6">
-      <p id="result-text" class="p-4 rounded-lg bg-white/50 dark:bg-black/20 text-gray-900 dark:text-white break-all"></p>
-      <div id="action-buttons" class="grid grid-cols-1 sm:grid-cols-2 gap-4 mt-4">
-        <button onclick="copyLink()" class="w-full bg-gray-200 dark:bg-gray-700 text-gray-800 dark:text-gray-200 font-semibold px-4 py-3 rounded-lg hover:bg-gray-300 dark:hover:bg-gray-600 transition-colors">📋 复制链接</button>
-        <a id="download-btn" href="#" target="_blank" class="w-full text-center btn-gradient text-white font-bold py-3 rounded-lg uppercase tracking-wider transform hover:scale-105">⚡ 立即下载</a>
+    <div id="result-area" hidden>
+      <p id="result-text"></p>
+      <div id="action-buttons">
+        <button id="copy-btn">📋 复制链接</button>
+        <a id="download-btn" target="_blank" rel="noopener noreferrer" class="btn-gradient">⚡ 立即下载</a>
       </div>
     </div>
   </div>
-  <div id="toast" class="toast fixed bottom-5 left-1/2 -translate-x-1/2 px-6 py-3 rounded-lg shadow-lg text-white font-semibold"></div>
-  <script>
+  <div id="toast" class="toast" role="status"></div>
+  <script nonce="${nonce}">
+    const ALLOWED_HOSTS = ${JSON.stringify(ALLOWED_HOSTS).replaceAll('<', '\\u003c')};
+    ${parseShareUrl.toString()}
+    ${isAllowedTarget.toString()}
+    ${proxyUrl.toString()}
     const workerDomain = window.location.origin;
     const urlInput = document.getElementById('source-url');
     const resultArea = document.getElementById('result-area');
@@ -117,20 +217,22 @@ const HOMEPAGE_HTML = `
     const lightIcon = document.getElementById('theme-icon-light');
     const darkIcon = document.getElementById('theme-icon-dark');
     let generatedLink = '';
+    let savedTheme;
+    try { savedTheme = localStorage.getItem('theme'); } catch { /* Storage is optional. */ }
     
     function setTheme(isDark) {
       document.body.classList.toggle('dark-mode', isDark);
       document.body.classList.toggle('light-mode', !isDark);
-      lightIcon.classList.toggle('hidden', isDark);
-      darkIcon.classList.toggle('hidden', !isDark);
-      localStorage.setItem('theme', isDark ? 'dark' : 'light');
+      lightIcon.toggleAttribute('hidden', isDark);
+      darkIcon.toggleAttribute('hidden', !isDark);
+      try { localStorage.setItem('theme', isDark ? 'dark' : 'light'); } catch { /* Storage is optional. */ }
     }
 
     themeToggle.addEventListener('click', () => {
         setTheme(document.body.classList.contains('light-mode'));
     });
 
-    if (localStorage.getItem('theme') === 'dark' || (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches && !localStorage.getItem('theme'))) {
+    if (savedTheme === 'dark' || (!savedTheme && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
         setTheme(true);
     } else {
         setTheme(false);
@@ -143,183 +245,245 @@ const HOMEPAGE_HTML = `
       toast.classList.add('show'); 
       setTimeout(() => toast.classList.remove('show'), 3000); 
     }
-    function generateLink() { 
-      const sourceUrl = urlInput.value.trim(); 
-      if (!sourceUrl) { showToast('请输入链接', true); return; } 
-      try { new URL(sourceUrl); } catch (e) { showToast('请输入有效的链接', true); return; } 
-      generatedLink = workerDomain + '/' + sourceUrl; 
-      resultText.textContent = generatedLink; 
-      downloadBtn.href = generatedLink; 
-      resultArea.classList.remove('hidden'); 
+    function generateLink() {
+      const sourceUrl = urlInput.value.trim();
+      generatedLink = '';
+      resultText.textContent = '';
+      downloadBtn.removeAttribute('href');
+      resultArea.hidden = true;
+      if (!sourceUrl) { showToast('请输入链接', true); return; }
+      let target;
+      try { target = parseShareUrl(sourceUrl); } catch { showToast('请输入有效的链接', true); return; }
+      if (!isAllowedTarget(target)) { showToast('请输入受支持的 HTTPS 分享链接', true); return; }
+      target.hash = '';
+      generatedLink = proxyUrl(workerDomain, target);
+      resultText.textContent = generatedLink;
+      downloadBtn.href = generatedLink;
+      resultArea.hidden = false;
     }
-    function copyLink() { 
-      if (!generatedLink) return; 
-      navigator.clipboard.writeText(generatedLink).then(() => { showToast('链接已复制到剪贴板'); }).catch(err => { showToast('复制失败', true); }); 
+    async function copyLink() {
+      if (!generatedLink) return;
+      try {
+        await navigator.clipboard.writeText(generatedLink);
+        showToast('链接已复制到剪贴板');
+      } catch {
+        showToast('复制失败', true);
+      }
     }
+    document.getElementById('generate-btn').addEventListener('click', generateLink);
+    document.getElementById('copy-btn').addEventListener('click', copyLink);
     urlInput.addEventListener('keyup', (event) => { if (event.key === 'Enter') generateLink(); });
   </script>
 </body>
 </html>
 `;
 
-/**
- * Google Drive 处理器 (v15.0 - 强制代理)
- * 此函数采用统一的手动重定向逻辑，确保所有流量都经过 Worker，防止代理“泄露”。
- * @param {URL} targetUrl 目标URL
- * @param {Request} request 原始请求
- * @param {string} workerOrigin worker域名
- * @returns {Promise<Response>}
- */
-async function handleGoogleDrive(targetUrl, request, workerOrigin) {
-  const upstreamHeaders = new Headers(request.headers);
-  upstreamHeaders.set('Host', targetUrl.hostname);
-  // 关键：对所有发往 Google 的请求都伪造 Referer，以通过防盗链检查。
-  upstreamHeaders.set('Referer', 'https://drive.google.com/');
+function normalizeDownloadTarget(target) {
+  if (target.hostname === 'www.dropbox.com') {
+    target.searchParams.set('dl', '1');
+  } else if (target.hostname === 'drive.google.com') {
+    const file = /^\/file\/d\/([\w-]+)(?:\/(?:view|preview|edit))?\/?$/.exec(target.pathname);
+    if (file) {
+      target.pathname = '/uc';
+      target.searchParams.set('id', file[1]);
+      target.searchParams.set('export', 'download');
+    }
+  }
+  target.hash = '';
+}
 
-  // 核心原则：始终手动处理重定向，捕获所有跳转指令。
-  const response = await fetch(targetUrl.toString(), {
-    method: request.method,
-    headers: upstreamHeaders,
-    redirect: 'manual', // 强制手动模式，绝不自动跟随。
-    body: request.body
-  });
+function isDriveDownloadEndpoint(target) {
+  return (target.hostname === 'drive.google.com' && target.pathname === '/uc') ||
+    (target.hostname === 'drive.usercontent.google.com' && target.pathname === '/download');
+}
 
-  const responseHeaders = new Headers(response.headers);
-
-  // 关键步骤：检查是否收到了跳转指令 (3xx 状态码 + Location 头)。
-  if (response.status >= 300 && response.status < 400 && responseHeaders.has('Location')) {
-    const location = responseHeaders.get('Location');
-    // 将 Google 的跳转地址构造成一个完整的 URL。
-    const newLocationUrl = new URL(location, targetUrl.toString());
-    // 将这个 URL 改写，让浏览器向我们的 Worker 发起下一次请求。
-    const newLocation = `${workerOrigin}/${newLocationUrl.toString()}`;
-    responseHeaders.set('Location', newLocation);
-
-    // 返回这个被我们修改过的跳转响应给浏览器。
-    return new Response(null, {
-      status: response.status,
-      statusText: response.statusText,
-      headers: responseHeaders,
-    });
+function rewriteConfirmation(response, target, workerOrigin) {
+  function resolveLink(value) {
+    try {
+      const url = new URL(value.replaceAll('&amp;', '&'), target);
+      return isAllowedTarget(url) ? url : null;
+    } catch {
+      return null;
+    }
   }
 
-  // 如果收到的内容是 HTML (例如病毒警告页面)，则需要改写页面内部的所有链接。
-  const contentType = responseHeaders.get('Content-Type') || '';
-  if (contentType.includes('text/html')) {
-    let body = await response.text();
+  const removeElement = { element: (element) => element.remove() };
+  const rewriteLink = {
+    element(element) {
+      const link = resolveLink(element.getAttribute('href'));
+      if (link) {
+        element.setAttribute('href', proxyUrl(workerOrigin, link));
+      } else {
+        element.removeAttribute('href');
+      }
+    },
+  };
 
-    const rewriteUrl = (originalUrl) => `${workerOrigin}/${originalUrl}`;
-
-    // 全面替换页面内的 action, src, href 属性中的绝对和相对链接。
-    body = body.replace(/(action|src|href)="https?:\/\/([^"]+)"/g, (match, attr, url) => {
-      const fullUrl = 'https://' + url;
-      try {
-        const hostname = new URL(fullUrl).hostname;
-        const isAllowed = ALLOWED_HOSTS.some(allowedHost =>
-          hostname === allowedHost || hostname.endsWith('.' + allowedHost)
-        );
-        if (isAllowed) {
-          return `${attr}="${rewriteUrl(fullUrl)}"`;
+  return new HTMLRewriter()
+    .on('*', {
+      element(element) {
+        for (const attribute of ['target', 'ping', 'attributionsrc', 'formaction', 'formmethod', 'formtarget']) {
+          element.removeAttribute(attribute);
         }
-      } catch (e) { /* 无效URL，忽略 */ }
-      return match;
-    });
-    body = body.replace(/(action|src|href)="\/([^"/][^"]*)"/g, (match, attr, path) => {
-      return `${attr}="${rewriteUrl(targetUrl.origin + '/' + path)}"`;
-    });
+      },
+    })
+    .on('base', removeElement)
+    .on('meta', removeElement)
+    .on('link', removeElement)
+    .on('script', removeElement)
+    .on('noscript', removeElement)
+    .on('svg', removeElement)
+    .on('math', removeElement)
+    .on('iframe', removeElement)
+    .on('object', removeElement)
+    .on('embed', removeElement)
+    .on('textarea', removeElement)
+    .on('select', removeElement)
+    .on('input', {
+      element(element) {
+        const type = element.getAttribute('type')?.toLowerCase();
+        if (type !== 'hidden' && type !== 'submit') element.remove();
+      },
+    })
+    .on('a[href]', rewriteLink)
+    .on('area[href]', rewriteLink)
+    .on('form', {
+      element(element) {
+        const action = resolveLink(element.getAttribute('action') ?? '');
+        if (!action || !isDriveDownloadEndpoint(action)) {
+          element.remove();
+          return;
+        }
+        // The browser supplies the confirmation fields in the proxy request's query.
+        action.search = '';
+        action.hash = '';
+        element.setAttribute('action', proxyUrl(workerOrigin, action));
+        element.setAttribute('method', 'get');
+      },
+    })
+    .transform(response);
+}
 
-    // 删除 Google 的安全策略头，否则它会阻止我们的改写生效。
-    responseHeaders.delete('Content-Security-Policy');
-
-    return new Response(body, {
-      status: response.status,
-      headers: responseHeaders,
-    });
-  }
-
-  // 如果既不是跳转，也不是 HTML (那就是最终的文件流)，则直接返回给用户。
-  return new Response(response.body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: responseHeaders,
+function errorResponse(message, status, method, extraHeaders = {}) {
+  return new Response(method === 'HEAD' ? null : message, {
+    status,
+    headers: { ...RESPONSE_HEADERS, ...extraHeaders, 'Content-Type': 'text/plain; charset=utf-8' },
   });
 }
 
-/**
- * 通用代理处理器 (Dropbox 及其他)
- * @param {URL} targetUrl 目标URL
- * @param {Request} request 原始请求
- * @param {string} workerOrigin worker域名
- * @returns {Promise<Response>}
- */
-async function simpleProxy(targetUrl, request, workerOrigin) {
-  if (targetUrl.hostname === 'www.dropbox.com') {
-    targetUrl.searchParams.set('dl', '1');
+async function proxyDownload(target, request, workerOrigin) {
+  normalizeDownloadTarget(target);
+  const upstreamHeaders = new Headers();
+  for (const name of REQUEST_HEADERS) {
+    const value = request.headers.get(name);
+    if (value !== null) upstreamHeaders.set(name, value);
+  }
+  if (target.hostname === 'drive.google.com' || target.hostname === 'drive.usercontent.google.com') {
+    upstreamHeaders.set('Referer', 'https://drive.google.com/');
   }
 
-  const response = await fetch(targetUrl.toString(), {
-    method: request.method,
-    headers: request.headers,
-    body: request.body,
-    redirect: 'manual'
-  });
-
-  const responseHeaders = new Headers(response.headers);
-  
-  if (response.status >= 300 && response.status < 400 && responseHeaders.has('Location')) {
-    const location = responseHeaders.get('Location');
-    const newLocationUrl = new URL(location, targetUrl.toString());
-    const newLocation = `${workerOrigin}/${newLocationUrl.toString()}`;
-    responseHeaders.set('Location', newLocation);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), UPSTREAM_HEADER_TIMEOUT_MS);
+  let response;
+  try {
+    response = await fetch(target.href, {
+      method: request.method,
+      headers: upstreamHeaders,
+      redirect: 'manual',
+      cf: { cacheTtl: 0 },
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
   }
 
-  return new Response(response.body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: responseHeaders,
-  });
+  const headers = new Headers(RESPONSE_HEADERS);
+  if (REDIRECT_STATUSES.has(response.status)) {
+    await response.body?.cancel();
+    const location = response.headers.get('Location');
+    let redirect;
+    try {
+      if (location?.trim()) redirect = new URL(location, target);
+    } catch { /* Invalid upstream Location. */ }
+    if (redirect?.hostname === 'accounts.google.com') {
+      return errorResponse('目标文件需要登录。请使用可公开下载的分享链接。', 403, request.method);
+    }
+    if (!redirect || !isAllowedTarget(redirect)) {
+      return errorResponse('目标服务返回了不受支持的重定向。', 502, request.method);
+    }
+    redirect.hash = '';
+    if (redirect.href === target.href) {
+      return errorResponse('目标服务返回了循环重定向。', 502, request.method);
+    }
+    headers.set('Location', proxyUrl(workerOrigin, redirect));
+    return new Response(null, { status: response.status, headers });
+  }
+
+  const contentType = response.headers.get('Content-Type') || '';
+  const isConfirmation = response.status === 200 && isDriveDownloadEndpoint(target) &&
+    contentType.split(';', 1)[0].trim().toLowerCase() === 'text/html' &&
+    !response.headers.has('Content-Disposition');
+  if (isConfirmation) {
+    headers.set('Content-Type', contentType);
+    headers.set('Content-Security-Policy',
+      "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; " +
+      'form-action ' + workerOrigin + '; sandbox allow-forms allow-downloads');
+    const body = request.method === 'HEAD' ? null : rewriteConfirmation(response, target, workerOrigin).body;
+    return new Response(body, { status: response.status, headers });
+  }
+
+  for (const name of DOWNLOAD_HEADERS) {
+    const value = response.headers.get(name);
+    if (value !== null) headers.set(name, value);
+  }
+  const disposition = headers.get('Content-Disposition') || '';
+  if (response.status !== 304) {
+    headers.set('Content-Disposition', disposition.replace(/^[^;]*/, 'attachment'));
+  }
+  if (!headers.has('Content-Type') && response.status !== 304) {
+    headers.set('Content-Type', 'application/octet-stream');
+  }
+  headers.set('Content-Security-Policy', "default-src 'none'; frame-ancestors 'none'; sandbox");
+  const body = request.method === 'HEAD' ? null : response.body;
+  return new Response(body, { status: response.status, headers });
 }
 
 export default {
   async fetch(request) {
-    const url = new URL(request.url);
-    const workerOrigin = url.origin;
+    if (request.method !== 'GET' && request.method !== 'HEAD') {
+      return errorResponse('仅支持 GET 和 HEAD 请求。', 405, request.method, { Allow: 'GET, HEAD' });
+    }
 
+    const url = new URL(request.url);
     if (url.pathname === '/') {
-      return new Response(HOMEPAGE_HTML, {
-        headers: { 'Content-Type': 'text/html; charset=utf-8' },
+      const nonce = crypto.randomUUID();
+      return new Response(request.method === 'HEAD' ? null : homepageHtml(nonce), {
+        headers: {
+          ...RESPONSE_HEADERS,
+          'Content-Type': 'text/html; charset=utf-8',
+          'Content-Security-Policy': "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; " +
+            "form-action 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'nonce-" + nonce + "'",
+        },
       });
     }
 
+    let target;
     try {
-      const decodedPath = decodeURIComponent(url.pathname);
-      const targetUrlStr = (decodedPath.substring(1) + url.search).trim();
-      
-      let targetUrl;
-      try {
-        targetUrl = new URL(targetUrlStr.startsWith('http') ? targetUrlStr : 'https://' + targetUrlStr);
-      } catch (e) {
-        return new Response('无效的目标链接格式。', { status: 400 });
-      }
+      const path = url.pathname.slice(1);
+      // Keep existing unencoded routes and preserve escapes within provider paths.
+      const source = /^https?%3a%2f%2f/i.test(path) ? decodeURIComponent(path) : path;
+      target = parseShareUrl(source + url.search);
+    } catch {
+      return errorResponse('无效的目标链接格式。', 400, request.method);
+    }
+    if (!isAllowedTarget(target)) {
+      return errorResponse('仅支持允许列表中的 HTTPS 下载地址。', 403, request.method);
+    }
 
-      const isAllowed = ALLOWED_HOSTS.some(allowedHost =>
-        targetUrl.hostname === allowedHost || targetUrl.hostname.endsWith('.' + allowedHost)
-      );
-
-      if (!isAllowed) {
-        return new Response(`错误：域名 ${targetUrl.hostname} 不在允许列表中。`, { status: 403 });
-      }
-
-      // 路由判断
-      if (targetUrl.hostname.includes('google.com')) {
-        return await handleGoogleDrive(targetUrl, request, workerOrigin);
-      } else {
-        return await simpleProxy(targetUrl, request, workerOrigin);
-      }
-
-    } catch (error) {
-      console.error('Fetch error:', error);
-      return new Response(`处理请求时发生错误: ${error.message}`, { status: 502 });
+    try {
+      return await proxyDownload(target, request, url.origin);
+    } catch {
+      return errorResponse('无法从目标服务获取文件。', 502, request.method);
     }
   },
 };
